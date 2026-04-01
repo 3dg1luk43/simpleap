@@ -11,7 +11,7 @@
 
 ---
 
-## 🔧 Driver setup (Realtek AU / Alfa AWUS on Kali 2024)
+## Driver setup (Realtek AU / Alfa AWUS on Kali 2024)
 
 **Follow this guide exactly (credit to Sapsan & Janek):**
 **[https://sapsan-sklep.pl/en/blogs/articles/alfa-awus-kali-linux-2024-fix-en](https://sapsan-sklep.pl/en/blogs/articles/alfa-awus-kali-linux-2024-fix-en)**
@@ -71,11 +71,14 @@ iw list | sed -n '/Supported interface modes:/,/Band 1/p'   # should include "AP
 ```bash
 chmod +x simpleap.sh
 
+# optional: run interactive installer first (pauses between steps)
+sudo ./simpleap.sh --install
+
 # Realtek/VM-friendly baseline: channel 1, compat mode, Burp on local :8080
 sudo ./simpleap.sh wlan0 eth0 PentestAP StrongPass123 \
   --channel 1 --mode compat \
-  --forward tcp:80->8080 \
-  --forward tcp:443->8080
+  --forward tcp:80=8080 \
+  --forward tcp:443=8080
 ```
 
 * SSID `PentestAP` on **2.4 GHz** ch 1.
@@ -87,13 +90,65 @@ Stop with **Ctrl-C** — rules and processes are removed.
 
 ---
 
+## Interactive installer (`--install`)
+
+You can run a guided setup assistant:
+
+```bash
+sudo ./simpleap.sh --install
+```
+
+What it does:
+
+1. Installs runtime packages required by `simpleap.sh`.
+2. Pauses before each logic step so output can be reviewed/intercepted.
+3. Prints the exact command before it runs (`[CMD] ...`).
+3. Asks approval before installing optional extras (not required for AP runtime), including:
+  - `tcpdump` (troubleshooting)
+  - `pipx` + `python3-venv` (preferred over direct `pip` for standalone Python CLI tools)
+  - optional Realtek AU driver helper flow
+
+Installer output is structured and explicit (`[STEP]`, `[INPUT]`, `[CMD]`, `[OK]`, `[INFO]`, `[DONE]`, `[NEXT]`).
+
+> `pipx` is preferred for Python CLI tooling because system `pip` installs are increasingly restricted without virtual environments.
+
+---
+
+## Cleanup utility (`--cleanup`)
+
+If a run crashes or leaves partial state, use the built-in comprehensive cleanup:
+
+```bash
+sudo ./simpleap.sh --cleanup
+```
+
+You can target non-default interfaces/subnet:
+
+```bash
+sudo ./simpleap.sh --cleanup --wifi-if wlan1 --uplink-if eth1 --subnet 10.20.30.0/24
+```
+
+What `--cleanup` does:
+
+- Stops `hostapd` and `dnsmasq`
+- Removes NAT PREROUTING REDIRECT/DNAT rules for the Wi-Fi interface
+- Removes known INPUT/OUTPUT/FORWARD/MASQUERADE rules added by the script
+- Flushes IP addresses on Wi-Fi interface, sets interface back to managed mode, sets it down
+- Re-enables NetworkManager management for the Wi-Fi interface (if `nmcli` is available)
+- Sets `net.ipv4.ip_forward=0`
+
+Output is structured and shows exact commands before execution.
+
+---
+
 ## Usage
 
 ```bash
 sudo ./simpleap.sh WIFI_IF UPLINK_IF SSID WPA2_PSK \
-  [--channel 6] [--subnet 10.10.10.0/24] [--gateway 10.10.10.1] \
+  [--channel 1] [--subnet 10.10.10.0/24] [--gateway 10.10.10.1] \
   [--dhcp-start 10.10.10.50] [--dhcp-end 10.10.10.150] \
   [--mode normal|compat] [--country CZ] \
+  [--debug] \
   [--forward SPEC]... \
   [--lease MAC=IP]...
 ```
@@ -107,12 +162,13 @@ sudo ./simpleap.sh WIFI_IF UPLINK_IF SSID WPA2_PSK \
 
 **Named options**
 
-* `--channel N` – 2.4 GHz channel (default `6`)
+* `--channel N` – 2.4 GHz channel (default `1`)
 * `--subnet CIDR` – default `10.10.10.0/24`
 * `--gateway IP` – default `10.10.10.1`
 * `--dhcp-start IP` / `--dhcp-end IP` – default `10.10.10.50`–`150`
 * `--mode normal|compat` – **use `compat` for Realtek AU**
 * `--country CC` – regdomain (default `CZ`)
+* `--debug` – print debug messages to stderr
 * `--forward SPEC` – port forward rule (below)
 * `--lease MAC=IP` – pin client leases
 
@@ -125,10 +181,10 @@ sudo ./simpleap.sh WIFI_IF UPLINK_IF SSID WPA2_PSK \
 
 `--forward` supports:
 
-* `tcp|udp:INPORT->DSTPORT` → **REDIRECT** to local router (`10.10.10.1:DSTPORT`)
-  e.g. `--forward tcp:80->8080`
-* `tcp|udp:INPORT->DSTIP:DSTPORT` → **DNAT** to `DSTIP:DSTPORT`
-  e.g. `--forward tcp:22->10.10.10.60:2222`
+* `tcp|udp:INPORT=DSTPORT` → **REDIRECT** to local router (`10.10.10.1:DSTPORT`)
+  e.g. `--forward tcp:80=8080`
+* `tcp|udp:INPORT=DSTIP:DSTPORT` → **DNAT** to `DSTIP:DSTPORT`
+  e.g. `--forward tcp:22=10.10.10.60:2222`
 
 Applied to **client traffic arriving on `WIFI_IF`** (PREROUTING).
 Hairpin `wlan0→wlan0` is allowed so DNAT to clients works.
@@ -174,6 +230,9 @@ Install on Kali:
 ```bash
 sudo apt update
 sudo apt install -y hostapd dnsmasq iptables tcpdump
+# optional Python CLI tooling manager (preferred over plain pip):
+sudo apt install -y pipx python3-venv
+pipx ensurepath
 # Driver: follow the Sapsan guide to install aircrack-ng rtl8812au @ commit 63cf0b4
 ```
 
@@ -223,20 +282,16 @@ sudo hostapd -dd /tmp/hapd-min.conf
 ```
 
 **TLS interception**
-`--forward tcp:443->8080` breaks HTTPS unless the device trusts your CA. Install the Burp CA (or only redirect 80).
+`--forward tcp:443=8080` breaks HTTPS unless the device trusts your CA. Install the Burp CA (or only redirect 80).
 
 **Crash cleanup (manual)**
 
 ```bash
-sudo pkill -9 hostapd dnsmasq
-sudo iptables -t nat -D POSTROUTING -o <UPLINK_IF> -j MASQUERADE 2>/dev/null || true
-sudo iptables -D INPUT -i <WIFI_IF> -s <SUBNET> -j ACCEPT 2>/dev/null || true
-sudo iptables -D INPUT -i <WIFI_IF> -p udp --dport 67 -j ACCEPT 2>/dev/null || true
-sudo iptables -D INPUT -i <WIFI_IF> -p udp --dport 68 -j ACCEPT 2>/dev/null || true
-sudo iptables -D INPUT -i <WIFI_IF> -p udp --dport 53 -j ACCEPT 2>/dev/null || true
-sudo iptables -D INPUT -i <WIFI_IF> -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
-sudo iptables -D INPUT -i <WIFI_IF> -p icmp -j ACCEPT 2>/dev/null || true
-sudo ip addr flush dev <WIFI_IF>; sudo ip link set <WIFI_IF> down
+# defaults: wlan0 / eth0 / 10.10.10.0/24
+sudo ./simpleap.sh --cleanup
+
+# custom targets
+sudo ./simpleap.sh --cleanup --wifi-if <WIFI_IF> --uplink-if <UPLINK_IF> --subnet <SUBNET>
 ```
 
 ---
