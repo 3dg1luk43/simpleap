@@ -11,58 +11,60 @@
 
 ---
 
-## Driver setup (Realtek AU / Alfa AWUS on Kali 2024)
+## Driver setup (Realtek AU / Alfa AWUS)
 
-**Follow this guide exactly (credit to Sapsan & Janek):**
-**[https://sapsan-sklep.pl/en/blogs/articles/alfa-awus-kali-linux-2024-fix-en](https://sapsan-sklep.pl/en/blogs/articles/alfa-awus-kali-linux-2024-fix-en)**
+**On current kernels (Kali ≥ 2025, kernel ≥ ~6.x, tested on 7.1.x): use the mainline
+`rtw88` driver. It is in-tree, needs no build, and supports AP mode natively.**
 
-Kali 2024.x broke the “latest” 8812au driver for AWUS cards; the adapter associates but doesn’t see networks or won’t beacon. Fix = install **older** aircrack-ng 8812au driver at **commit `63cf0b4`**.
+The RTL8811/8812/8814AU chips used by the Alfa AWUS036AC / AWUS036ACS are now handled
+by the kernel's `rtw88` USB driver (`rtw88_8812au`, `rtw88_8821au`, `rtw88_8814au`).
+Because `rtw88` is a `mac80211`/`cfg80211` driver, `hostapd` drives it directly — no
+DKMS, no pinned commits.
 
-> **Do the steps in this order on the VM host OS:**
+> The old out-of-tree aircrack-ng `rtl8812au` @ `63cf0b4` recipe (for Kali 2024) is
+> **obsolete and no longer compiles** on modern kernels: they removed the deprecated
+> `EXTRA_CFLAGS`/`EXTRA_LDFLAGS` Kbuild vars (now `ccflags-y`/`ldflags-y`), the legacy
+> timer API (`from_timer`/`del_timer*` → `timer_container_of`/`timer_delete*`), and
+> migrated many `cfg80211_ops` from `net_device` to `wireless_dev`. Don't fight that —
+> use `rtw88`.
 
 ```bash
-# 0) Update OS and reboot
-sudo apt update
-sudo apt upgrade -y
+# 1) Update the OS (get the newest rtw88 from the kernel package)
+sudo apt update && sudo apt full-upgrade -y
 sudo reboot now
 ```
 
 ```bash
-# 1) Prereqs
-sudo apt install -y linux-headers-$(uname -r) dkms
-dkms status    # note any 8812au versions present
+# 2) Make sure nothing blacklists the in-tree driver
+grep -rniE 'rtw88|rtl8xxxu' /etc/modprobe.d/ | grep -i blacklist   # expect no output
 ```
 
 ```bash
-# 2) Remove any existing 8812au DKMS modules (adjust version string if different)
-sudo dkms uninstall 8812au/5.6.4.2_35491.20191025
-sudo dkms remove    8812au/5.6.4.2_35491.20191025 --all
+# 3) Load the driver (usually automatic on plug-in) and confirm the interface
+sudo modprobe rtw88_8812au     # RTL8812AU (AWUS036AC)
+sudo modprobe rtw88_8821au     # RTL8811AU (AWUS036ACS)
+# plug the adapter in, then:
+iw dev                          # should show wlanX
 ```
 
 ```bash
-# 3) Get the aircrack-ng driver and pin to commit 63cf0b4 (on tag v5.6.4.2)
-git clone -b v5.6.4.2 https://github.com/aircrack-ng/rtl8812au.git
-cd rtl8812au
-git checkout 63cf0b4
-```
-
-```bash
-# 4) Build & install via DKMS
-sudo make dkms_install
-sudo reboot now
-```
-
-After reboot, plug the AWUS and verify it enumerates, can scan, and supports **AP** mode:
-
-```bash
-ip link show
-iw list | sed -n '/Supported interface modes:/,/Band 1/p'   # should include "AP"
+# 4) Verify AP mode is supported
+iw list | sed -n '/Supported interface modes:/,/Band 1/p'   # must include "* AP"
 ```
 
 > **Notes**
 >
-> * If you previously installed `realtek-rtl88xxau-dkms`, remove it before installing the pinned aircrack driver (to avoid module conflicts).
-> * If you swap kernels, re-run `sudo make dkms_install`.
+> * If you previously installed an out-of-tree `8812au` / `realtek-rtl88xxau-dkms`,
+>   remove any `blacklist rtw88` / `blacklist rtl8xxxu` lines it dropped in
+>   `/etc/modprobe.d/`, otherwise the in-tree driver can't bind.
+> * A stale `dkms status` entry for `8812au` that only shows `added` (never built) is
+>   harmless, but you can drop it: `sudo dkms remove 8812au/<version> --all`.
+> * `rtw88` is maintained with the kernel, so kernel upgrades don't require a rebuild.
+>
+> **Only if `rtw88` genuinely fails for your specific adapter**, the interactive
+> installer (`--install`) offers an out-of-tree DKMS fallback that clones current
+> aircrack-ng `master` — note it may still need manual source patches on bleeding-edge
+> kernels.
 
 ---
 
@@ -71,7 +73,7 @@ iw list | sed -n '/Supported interface modes:/,/Band 1/p'   # should include "AP
 ```bash
 chmod +x simpleap.sh
 
-# optional: run interactive installer first (pauses between steps)
+# one-shot automatic setup: installs deps + the right driver for your kernel
 sudo ./simpleap.sh --install
 
 # Realtek/VM-friendly baseline: channel 1, compat mode, Burp on local :8080
@@ -90,9 +92,9 @@ Stop with **Ctrl-C** — rules and processes are removed.
 
 ---
 
-## Interactive installer (`--install`)
+## Automatic installer (`--install`)
 
-You can run a guided setup assistant:
+Fully automatic, **no prompts** — run it once and it sets everything up:
 
 ```bash
 sudo ./simpleap.sh --install
@@ -100,17 +102,23 @@ sudo ./simpleap.sh --install
 
 What it does:
 
-1. Installs runtime packages required by `simpleap.sh`.
-2. Pauses before each logic step so output can be reviewed/intercepted.
-3. Prints the exact command before it runs (`[CMD] ...`).
-3. Asks approval before installing optional extras (not required for AP runtime), including:
-  - `tcpdump` (troubleshooting)
-  - `pipx` + `python3-venv` (preferred over direct `pip` for standalone Python CLI tools)
-  - optional Realtek AU driver helper flow
+1. Installs runtime packages (`hostapd dnsmasq iptables iproute2 iw tcpdump`).
+2. Verifies the required tools are present.
+3. **Autodetects the running kernel and installs the appropriate Wi-Fi driver:**
+   - Kernel **with in-tree `rtw88` AU support** (Kali ≥ 2025 / kernel ≥ ~6.x, incl. the
+     7.x series): loads the mainline `rtw88` driver — **no build**. If an older
+     out-of-tree install left a `blacklist rtw88`/`rtl8xxxu` line behind, it is
+     neutralized automatically so the in-tree driver can bind.
+   - Kernel **without** in-tree AU support (legacy): clones aircrack-ng `rtl8812au`,
+     applies modern-kernel compatibility patches (`ccflags-y`, timer-API shims,
+     disables the bridge extension) and installs it via **DKMS**.
+4. Reports the detected Wi-Fi interfaces and confirms AP-mode capability.
 
-Installer output is structured and explicit (`[STEP]`, `[INPUT]`, `[CMD]`, `[OK]`, `[INFO]`, `[DONE]`, `[NEXT]`).
+Because the driver decision is made from `uname -r` at run time, the same command
+**works across both installed kernels** — boot either one and re-run `--install`
+(the in-tree driver ships per-kernel; a DKMS driver auto-rebuilds per-kernel).
 
-> `pipx` is preferred for Python CLI tooling because system `pip` installs are increasingly restricted without virtual environments.
+Installer output is structured and explicit (`[STEP]`, `[CMD]`, `[OK]`, `[INFO]`, `[WARN]`, `[DONE]`, `[NEXT]`).
 
 ---
 
@@ -233,7 +241,8 @@ sudo apt install -y hostapd dnsmasq iptables tcpdump
 # optional Python CLI tooling manager (preferred over plain pip):
 sudo apt install -y pipx python3-venv
 pipx ensurepath
-# Driver: follow the Sapsan guide to install aircrack-ng rtl8812au @ commit 63cf0b4
+# Driver: on current kernels the in-tree rtw88 driver already supports AWUS AU cards
+#         (see "Driver setup" above) - no out-of-tree DKMS build needed.
 ```
 
 ---

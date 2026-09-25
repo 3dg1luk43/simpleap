@@ -2,7 +2,7 @@
 # simple_ap.sh — 2.4GHz WPA2 AP for pentesting; hostapd+dnsmasq; iptables NAT/filters; logs; Ctrl+C cleanup
 # Positional: WIFI_IF UPLINK_IF SSID WPA2_PSK
 # Utility mode:
-#   --install                Interactive setup assistant (step-by-step, with pauses)
+#   --install                Automatic setup: deps + kernel-appropriate Wi-Fi driver (no prompts)
 #   --cleanup                Comprehensive cleanup (rules/processes/interfaces)
 # Named:
 #   --channel N               (default: 1)
@@ -20,32 +20,6 @@ set -euo pipefail
 usage() { sed -n '1,70p' "$0" | sed 's/^# \{0,1\}//' | sed -n '1,60p'; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 debug(){ [[ ${DEBUG:-0} -eq 1 ]] && echo "[DEBUG] $*" >&2 || true; }
-
-pause_step(){
-  local msg="$1"
-  echo
-  echo "[STEP] $msg"
-  read -r -p "[INPUT] Press Enter to continue, or type q to quit: " _ans
-  if [[ "${_ans:-}" == "q" || "${_ans:-}" == "Q" ]]; then
-    echo "[INFO] Install aborted by user"
-    exit 0
-  fi
-  return 0
-}
-
-ask_approval(){
-  local prompt="$1"
-  local ans
-  while true; do
-    read -r -p "[INPUT] ${prompt} [y/N/q]: " ans
-    case "${ans:-}" in
-      y|Y) return 0 ;;
-      n|N|"") return 1 ;;
-      q|Q) echo "[INFO] Install aborted by user"; exit 0 ;;
-      *) echo "[WARN] Please answer y, n, or q." ;;
-    esac
-  done
-}
 
 run_cmd(){
   local cmd="$1"
@@ -161,81 +135,140 @@ run_cleanup(){
   exit 0
 }
 
+# True if the given kernel ships an in-tree rtw88 driver for RTL88xxAU USB chips
+# (RTL8811AU/8812AU/8814AU as used by Alfa AWUS036AC/ACS). Works on modern kernels
+# (Kali >= 2025 / kernel >= ~6.x, incl. the 7.x series).
+intree_au_supported(){
+  local krel="$1"
+  local d="/lib/modules/${krel}/kernel/drivers/net/wireless/realtek/rtw88"
+  ls "$d"/rtw88_8812au.ko* "$d"/rtw88_8821au.ko* "$d"/rtw88_8814au.ko* 2>/dev/null | grep -q .
+}
+
+# Neutralize any modprobe blacklist that would stop the in-tree driver from binding
+# (left behind by older out-of-tree DKMS installs).
+unblacklist_intree(){
+  local f matched=0
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    sed -i -E 's/^([[:space:]]*blacklist[[:space:]]+(rtw88[[:alnum:]_]*|rtl8xxxu).*)$/# disabled by simpleap: \1/' "$f"
+    echo "[INFO] neutralized in-tree-driver blacklist in $f"
+    matched=1
+  done < <(grep -rslE '^[[:space:]]*blacklist[[:space:]]+(rtw88|rtl8xxxu)' /etc/modprobe.d/ 2>/dev/null || true)
+  [[ $matched -eq 1 ]] && { run_cmd "depmod -a"; } || echo "[OK] no in-tree-driver blacklist present"
+}
+
+# Load the in-tree rtw88 USB stack (covers AWUS036AC = 8812AU, AWUS036ACS = 8811AU).
+load_rtw88(){
+  local m
+  for m in rtw88_8812au rtw88_8821au rtw88_8814au; do
+    if modprobe "$m" 2>/dev/null; then echo "[OK] loaded $m"; fi
+  done
+}
+
+# Best-effort patches so the out-of-tree aircrack driver builds on modern kernels.
+# Harmless on old kernels (ccflags-y has always worked; timer shims are version-guarded).
+patch_outoftree_driver(){
+  local src="$1"
+  [[ -f "$src/Makefile" ]] || return 0
+  # 1) kernel 7.x removed deprecated EXTRA_CFLAGS/EXTRA_LDFLAGS -> use supported names
+  sed -i -E 's/\bEXTRA_CFLAGS\b/ccflags-y/g; s/\bEXTRA_LDFLAGS\b/ldflags-y/g' "$src/Makefile"
+  # 2) drop the proprietary bridge/NAT extension (unneeded here; breaks on new kernels)
+  sed -i -E 's/^CONFIG_BR_EXT[[:space:]]*=[[:space:]]*y/CONFIG_BR_EXT = n/' "$src/Makefile"
+  # 3) legacy timer API removed in 6.15/6.16 -> shim onto the current API
+  local hdr="$src/include/osdep_service_linux.h"
+  if [[ -f "$hdr" ]] && ! grep -q 'simpleap timer compat' "$hdr"; then
+    awk '
+      /#include <linux\/version.h>/ && !done {
+        print
+        print "/* simpleap timer compat: 6.15 removed del_timer*, 6.16 removed from_timer */"
+        print "#include <linux/timer.h>"
+        print "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0))"
+        print "  #ifndef from_timer"
+        print "    #define from_timer(a, b, c) timer_container_of(a, b, c)"
+        print "  #endif"
+        print "#endif"
+        print "#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))"
+        print "  #ifndef del_timer_sync"
+        print "    #define del_timer_sync(t) timer_delete_sync(t)"
+        print "  #endif"
+        print "  #ifndef del_timer"
+        print "    #define del_timer(t) timer_delete(t)"
+        print "  #endif"
+        print "#endif"
+        done=1; next
+      }
+      { print }
+    ' "$hdr" > "$hdr.simpleap" && mv "$hdr.simpleap" "$hdr"
+  fi
+  echo "[INFO] applied modern-kernel compat patches to out-of-tree source"
+}
+
+# Build+install the out-of-tree aircrack-ng rtl8812au driver via DKMS (legacy fallback).
+build_outoftree_driver(){
+  local krel="$1"
+  local src="/usr/src/rtl8812au.simpleap"
+  run_cmd "apt-get install -y linux-headers-${krel} dkms git build-essential"
+  run_cmd "rm -rf ${src}"
+  run_cmd "git clone --depth 1 https://github.com/aircrack-ng/rtl8812au.git ${src}"
+  patch_outoftree_driver "${src}"
+  if make -C "${src}" dkms_install; then
+    echo "[OK] out-of-tree driver installed via DKMS (reboot may be required)"
+  else
+    echo "[ERROR] out-of-tree driver build failed on kernel ${krel}."
+    echo "[ERROR] Prefer a kernel with in-tree rtw88 (Kali >= 2025 / kernel >= ~6.x)."
+    return 1
+  fi
+}
+
+# Autodetect the running kernel and install the appropriate driver:
+#   in-tree rtw88 if the kernel provides it (no build), else out-of-tree DKMS.
+install_driver_auto(){
+  local krel="$1"
+  if intree_au_supported "$krel"; then
+    echo "[INFO] kernel ${krel}: in-tree rtw88 supports RTL88xxAU (AWUS036AC/ACS) -> using it"
+    unblacklist_intree
+    load_rtw88
+  else
+    echo "[INFO] kernel ${krel}: no in-tree rtw88 AU support -> building out-of-tree DKMS driver"
+    build_outoftree_driver "$krel"
+  fi
+}
+
+# Fully automatic, non-interactive setup: deps + kernel-appropriate driver.
 run_install(){
-  local _c
-
-  [[ -t 0 && -t 1 ]] || die "--install requires an interactive TTY (run directly in a terminal)"
   [[ $(id -u) -eq 0 ]] || die "run installer as root (sudo ./simpleap.sh --install)"
-  command -v apt >/dev/null || die "apt not found (installer currently supports Debian/Kali/Ubuntu apt-based systems)"
+  command -v apt-get >/dev/null || die "apt-get not found (installer supports Debian/Kali/Ubuntu)"
 
-  echo "[INFO] Interactive setup assistant"
-  echo "[INFO] Commands are shown before execution"
-  echo "[INFO] You manually approve each step"
+  local KREL; KREL="$(uname -r)"
+  export DEBIAN_FRONTEND=noninteractive
 
-  pause_step "Step 1/6: refresh package metadata (apt update)"
-  run_cmd "apt update"
+  echo "[INFO] simpleap automated setup (non-interactive)"
+  echo "[INFO] kernel: ${KREL}"
 
-  pause_step "Step 2/6: install runtime deps required for simpleap.sh"
-  run_cmd "apt install -y hostapd dnsmasq iptables iproute2 iw"
+  echo "[STEP] 1/4 refresh package metadata"
+  run_cmd "apt-get update -y -q"
 
-  pause_step "Step 3/6: verify tools required by script are present"
+  echo "[STEP] 2/4 install runtime + support packages"
+  run_cmd "apt-get install -y hostapd dnsmasq iptables iproute2 iw tcpdump"
+
+  echo "[STEP] 3/4 verify required tools"
   for cmd in ip iw hostapd dnsmasq iptables ss; do
     command -v "$cmd" >/dev/null || die "missing after install: $cmd"
-    echo "[OK] Found: $cmd"
+    echo "[OK] $cmd"
   done
 
-  if ask_approval "Optional: install tcpdump for troubleshooting captures?"; then
-    run_cmd "apt install -y tcpdump"
-  else
-    echo "[INFO] Skipped optional tcpdump"
-  fi
-
-  if ask_approval "Optional: install pipx (preferred over pip for standalone Python CLI tools)?"; then
-    run_cmd "apt install -y pipx python3-venv"
-    run_cmd "pipx ensurepath || true"
-    echo "[INFO] pipx installed. Open a new shell session if PATH did not refresh."
-  else
-    echo "[INFO] Skipped optional pipx"
-  fi
-
-  if ask_approval "Optional: run Realtek AU driver helper steps (for AWUS/rtl8812au scenarios)?"; then
-    pause_step "Driver helper: install build dependencies"
-    run_cmd "apt install -y linux-headers-\"$(uname -r)\" dkms git build-essential"
-
-    pause_step "Driver helper: show dkms status"
-    run_cmd "dkms status || true"
-
-    if ask_approval "Driver helper: remove currently installed 8812au DKMS entries (if any)?"; then
-      while IFS= read -r modver; do
-        [[ -z "$modver" ]] && continue
-        echo "[INFO] Removing DKMS entry: $modver"
-        run_cmd "dkms remove \"$modver\" --all || true"
-      done < <(dkms status | awk -F, '/8812au/ {gsub(/ /, "", $1); print $1}')
-    else
-      echo "[INFO] Skipped automatic DKMS removal"
-    fi
-
-    pause_step "Driver helper: clone/pin aircrack-ng rtl8812au to commit 63cf0b4"
-    run_cmd "rm -rf /tmp/rtl8812au.install"
-    run_cmd "git clone -b v5.6.4.2 https://github.com/aircrack-ng/rtl8812au.git /tmp/rtl8812au.install"
-    run_cmd "git -C /tmp/rtl8812au.install checkout 63cf0b4"
-
-    if ask_approval "Driver helper: run 'make dkms_install' now?"; then
-      run_cmd "make -C /tmp/rtl8812au.install dkms_install"
-      echo "[INFO] Driver install finished. Reboot is recommended before AP use."
-    else
-      echo "[INFO] Skipped make dkms_install. You can run it manually in /tmp/rtl8812au.install"
-    fi
-  else
-    echo "[INFO] Skipped optional Realtek driver helper"
-  fi
-
-  pause_step "Step 6/6: final quick capability check (iw list)"
-  run_cmd "iw list | sed -n '/Supported interface modes:/,/Band 1/p' || true"
+  echo "[STEP] 4/4 autodetect + install Wi-Fi driver"
+  install_driver_auto "$KREL" || echo "[WARN] driver step did not complete cleanly (see messages above)"
 
   echo
-  echo "[DONE] Setup assistant completed"
-  echo "[NEXT] Run AP mode, for example:"
+  echo "[INFO] Wi-Fi interfaces detected:"
+  iw dev 2>/dev/null | awk '/Interface/{print "       - "$2}' || true
+  echo "[INFO] AP-mode capability (must list '* AP'):"
+  iw list 2>/dev/null | sed -n '/Supported interface modes:/,/Band 1/p' | sed 's/^/       /' || true
+
+  echo
+  echo "[DONE] Setup complete"
+  echo "[NEXT] Plug in the Wi-Fi adapter (if not already), then start the AP, e.g.:"
   echo "       sudo ./simpleap.sh wlan0 eth0 PentestAP StrongPass123 --mode compat --channel 1"
   exit 0
 }
