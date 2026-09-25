@@ -14,7 +14,13 @@
 #   --country CC              (default: CZ)
 #   --forward SPEC            (repeatable)       # tcp|udp:INPORT=DSTPORT  or  tcp|udp:INPORT=DSTIP:DSTPORT
 #   --lease MAC=IP            (repeatable)       # static DHCP lease
+#   --proxy-port N           (default: 8080)    # transparent-proxy target (Burp), toggled live with 'p'
+#   --proxy-ports "P.."      (default: "80 443")# client TCP dports redirected when proxy is ON
+#   --proxy-on                                  # start with the proxy redirect enabled (default off)
 #   --debug                   (optional)
+# Live hotkeys (when run in a terminal): p = toggle proxy on/off,  q = quit
+#   proxy ON  -> client tcp {proxy-ports} REDIRECT to local :proxy-port (Burp)
+#   proxy OFF -> client traffic goes straight to the Internet (NAT only)
 set -euo pipefail
 
 usage() { sed -n '1,70p' "$0" | sed 's/^# \{0,1\}//' | sed -n '1,60p'; }
@@ -31,6 +37,47 @@ print_cmd(){
   printf '[CMD] '
   printf '%q ' "$@"
   printf '\n'
+}
+
+# --- native nftables firewall support ---------------------------------------
+# Some hosts (Kali/Debian with nftables.service, etc.) run a *native* nftables
+# firewall in `table inet filter` with a base chain on the input/forward hook and
+# policy drop. That base chain co-exists with the iptables (ip filter) chain this
+# script edits, and BOTH run on each packet - so an iptables ACCEPT is overridden
+# by the inet-filter drop policy (symptom: client associates but never gets DHCP,
+# and no forwarding). These helpers add matching accepts into that table and track
+# them by handle for clean removal.
+NFT_ADDED_RULES=()
+
+# True if a native `inet filter` firewall base chain on the given hook drops by default.
+nft_native_drop(){
+  local chain="$1"
+  command -v nft >/dev/null 2>&1 || return 1
+  nft list chain inet filter "$chain" 2>/dev/null | grep -q 'hook '"$chain"'.*policy drop'
+}
+
+# Add a rule to inet filter and remember its handle for cleanup. Args: chain expr...
+nft_add(){
+  local chain="$1"; shift
+  local out h
+  out="$(nft --echo --handle add rule inet filter "$chain" "$@" 2>/dev/null)" || return 1
+  h="$(printf '%s\n' "$out" | sed -n 's/.*# handle \([0-9][0-9]*\).*/\1/p' | tail -1)"
+  [[ -n "$h" ]] && NFT_ADDED_RULES+=("$chain $h")
+  print_cmd nft add rule inet filter "$chain" "$@"
+}
+
+# Remove every inet-filter input/forward rule referencing the given interface name
+# (used by --cleanup, which does not have the tracked handles from a live run).
+nft_purge_wifi(){
+  local wifi="$1" chain h
+  command -v nft >/dev/null 2>&1 || return 0
+  for chain in input forward; do
+    while read -r h; do
+      [[ -z "$h" ]] && continue
+      echo "[CMD] nft delete rule inet filter $chain handle $h"
+      nft delete rule inet filter "$chain" handle "$h" 2>/dev/null || true
+    done < <(nft -a list chain inet filter "$chain" 2>/dev/null | grep "\"$wifi\"" | grep -oE 'handle [0-9]+' | awk '{print $2}')
+  done
 }
 
 delete_rule_all(){
@@ -111,6 +158,9 @@ run_cleanup(){
   delete_rule_all "" FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
   delete_rule_all "nat" POSTROUTING -o "$up_if" -j MASQUERADE
 
+  echo "[STEP] Remove native nftables (inet filter) accepts for wifi interface"
+  nft_purge_wifi "$wifi_if"
+
   echo "[STEP] Restore interface/network state"
   if ip link show "$wifi_if" >/dev/null 2>&1; then
     print_cmd ip addr flush dev "$wifi_if"
@@ -158,8 +208,24 @@ unblacklist_intree(){
 }
 
 # Load the in-tree rtw88 USB stack (covers AWUS036AC = 8812AU, AWUS036ACS = 8811AU).
+# Also persist AP-friendly tuning: deep power-save makes the adapter sleep and drop
+# client data frames (symptom: associates + 4-way handshake OK, but no DHCP/data);
+# USB-3 mode self-interferes on 2.4 GHz. Both are common causes of "connects but no IP".
 load_rtw88(){
-  local m
+  local m conf=/etc/modprobe.d/rtw88-ap.conf
+  if [[ ! -f "$conf" ]] || ! grep -q 'disable_lps_deep=Y' "$conf" 2>/dev/null; then
+    cat > "$conf" <<'EOF'
+# simpleap: AP-friendly tuning for rtw88 USB Realtek AU adapters
+options rtw88_core disable_lps_deep=Y
+options rtw88_usb switch_usb_mode=N
+EOF
+    echo "[OK] wrote $conf (disable_lps_deep=Y, switch_usb_mode=N)"
+    # reload so the options take effect if the stack is already loaded
+    if lsmod | grep -q '^rtw88_core'; then
+      modprobe -r rtw88_8812au rtw88_8821au rtw88_8814au 2>/dev/null || true
+      modprobe -r rtw88_8821a rtw88_8812a rtw88_8814a rtw88_88xxa rtw88_usb rtw88_core 2>/dev/null || true
+    fi
+  fi
   for m in rtw88_8812au rtw88_8821au rtw88_8814au; do
     if modprobe "$m" 2>/dev/null; then echo "[OK] loaded $m"; fi
   done
@@ -312,6 +378,9 @@ DHCP_END="10.10.10.150"
 MODE="compat"
 COUNTRY="CZ"
 DEBUG=0
+PROXY_PORT=8080          # transparent-proxy target (Burp), toggled live with 'p'
+PROXY_PORTS="80 443"     # client TCP dports transparently redirected when proxy is ON
+PROXY_ON=0               # runtime state of the transparent proxy toggle
 
 FORWARDS=()
 LEASES=()
@@ -327,6 +396,9 @@ while [[ $# -gt 0 ]]; do
     --country)                 COUNTRY="${2?}"; shift 2 ;;
     --forward)                 FORWARDS+=("${2?}"); shift 2 ;;
     --lease)                   LEASES+=("${2?}"); shift 2 ;;
+    --proxy-port)              PROXY_PORT="${2?}"; shift 2 ;;
+    --proxy-ports)             PROXY_PORTS="${2?}"; shift 2 ;;  # e.g. "80 443 8443"
+    --proxy-on)                PROXY_ON=1; shift ;;             # start with redirect enabled
     --debug)                   DEBUG=1; shift ;;
     -h|--help)                 usage; exit 0 ;;
     *) die "unknown option: $1" ;;
@@ -392,6 +464,16 @@ cleanup(){
   iptables -D FORWARD -i "$WIFI_IF" -o "$WIFI_IF" -j ACCEPT 2>/dev/null || true
   iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
   iptables -t nat -D POSTROUTING -o "$UP_IF" -j MASQUERADE 2>/dev/null || true
+  for _nftrule in "${NFT_ADDED_RULES[@]:-}"; do
+    [[ -z "$_nftrule" ]] && continue
+    set -- $_nftrule   # chain handle
+    nft delete rule inet filter "$1" handle "$2" 2>/dev/null || true
+  done
+  for _pp in ${PROXY_PORTS:-}; do
+    while iptables -t nat -C PREROUTING -i "$WIFI_IF" -p tcp --dport "$_pp" -j REDIRECT --to-ports "${PROXY_PORT:-8080}" 2>/dev/null; do
+      iptables -t nat -D PREROUTING -i "$WIFI_IF" -p tcp --dport "$_pp" -j REDIRECT --to-ports "${PROXY_PORT:-8080}" 2>/dev/null || break
+    done
+  done
   if [[ -s "${RUNDIR}/fw.rules" ]]; then
     while read -r line; do
       iptables $line 2>/dev/null || true
@@ -438,6 +520,26 @@ iptables -C FORWARD -i "$UP_IF"  -o "$WIFI_IF" -j ACCEPT 2>/dev/null || iptables
 iptables -C FORWARD -i "$WIFI_IF" -o "$WIFI_IF" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$WIFI_IF" -o "$WIFI_IF" -j ACCEPT
 iptables -C FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -t nat -C POSTROUTING -o "$UP_IF" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$UP_IF" -j MASQUERADE
+
+# If a native nftables firewall (inet filter) with a drop policy is active, the
+# iptables rules above are silently overridden by it. Add matching accepts there.
+if command -v nft >/dev/null 2>&1 && nft list table inet filter >/dev/null 2>&1; then
+  if nft_native_drop input; then
+    echo "[*] native nftables firewall detected (inet filter/input drop) - adding AP accepts"
+    nft_add input iifname "$WIFI_IF" udp dport 67 accept
+    nft_add input iifname "$WIFI_IF" udp dport 68 accept
+    nft_add input iifname "$WIFI_IF" udp dport 53 accept
+    nft_add input iifname "$WIFI_IF" tcp dport 53 accept
+    nft_add input iifname "$WIFI_IF" ip protocol icmp accept
+    nft_add input iifname "$WIFI_IF" ip saddr "$SUBNET" accept
+  fi
+  if nft_native_drop forward; then
+    echo "[*] native nftables firewall (inet filter/forward drop) - adding forwarding accepts"
+    nft_add forward iifname "$WIFI_IF" oifname "$UP_IF" accept
+    nft_add forward iifname "$UP_IF" oifname "$WIFI_IF" ct state established,related accept
+    nft_add forward iifname "$WIFI_IF" oifname "$WIFI_IF" accept
+  fi
+fi
 
 mkdir -p "$CTRL_DIR"
 cat > "$HCONF" <<EOF
@@ -547,6 +649,41 @@ for spec in "${FORWARDS[@]}"; do
   fi
 done
 
+# --- transparent proxy toggle (live hotkey 'p') -----------------------------
+# ON  = client tcp {$PROXY_PORTS} REDIRECT to local :$PROXY_PORT (Burp/mitmproxy).
+# OFF = client traffic goes straight out via NAT. Toggled on the fly with 'p'.
+proxy_apply(){   # $1 = on|off
+  local p
+  for p in $PROXY_PORTS; do
+    if [[ "$1" == "on" ]]; then
+      iptables -t nat -C PREROUTING -i "$WIFI_IF" -p tcp --dport "$p" -j REDIRECT --to-ports "$PROXY_PORT" 2>/dev/null \
+        || iptables -t nat -A PREROUTING -i "$WIFI_IF" -p tcp --dport "$p" -j REDIRECT --to-ports "$PROXY_PORT"
+    else
+      while iptables -t nat -C PREROUTING -i "$WIFI_IF" -p tcp --dport "$p" -j REDIRECT --to-ports "$PROXY_PORT" 2>/dev/null; do
+        iptables -t nat -D PREROUTING -i "$WIFI_IF" -p tcp --dport "$p" -j REDIRECT --to-ports "$PROXY_PORT" 2>/dev/null || break
+      done
+    fi
+  done
+  # drop existing client conntrack so the new routing applies to live flows immediately
+  command -v conntrack >/dev/null 2>&1 && conntrack -D -s "$SUBNET" >/dev/null 2>&1 || true
+}
+
+proxy_toggle(){
+  if [[ $PROXY_ON -eq 1 ]]; then
+    proxy_apply off; PROXY_ON=0
+    echo "[PROXY] OFF -> ${WIFI_IF} clients go straight to Internet (NAT only)"
+  else
+    proxy_apply on;  PROXY_ON=1
+    echo "[PROXY] ON  -> ${WIFI_IF} clients tcp {${PROXY_PORTS}} REDIRECT to :${PROXY_PORT}"
+  fi
+}
+
+# apply the requested initial state (default OFF, or ON via --proxy-on)
+if [[ $PROXY_ON -eq 1 ]]; then
+  proxy_apply on
+  echo "[*] transparent proxy START state: ON (tcp {${PROXY_PORTS}} -> :${PROXY_PORT})"
+fi
+
 echo
 echo "[*] AP '${SSID}' up on ${WIFI_IF} (2.4 GHz ch ${CHANNEL}, mode ${MODE}, country ${COUNTRY})"
 echo "[*] logs: ${HLOG}, ${DLOG} ; leases: ${LEASEFILE}"
@@ -592,4 +729,18 @@ monitor_services(){
 }
 
 monitor_services & MONITOR_PID=$!
-wait
+
+# Interactive hotkeys when attached to a TTY; otherwise just wait (background/CI safe).
+if [[ -t 0 ]]; then
+  echo "[*] hotkeys:  p = toggle proxy redirect (tcp {${PROXY_PORTS}} -> :${PROXY_PORT})   q = quit"
+  while [[ $SHUTDOWN_REQUESTED -eq 0 ]]; do
+    if IFS= read -rsn1 -t 1 _key 2>/dev/null; then
+      case "$_key" in
+        p|P) proxy_toggle ;;
+        q|Q) echo "[*] quit via hotkey"; break ;;
+      esac
+    fi
+  done
+else
+  wait
+fi

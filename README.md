@@ -199,6 +199,35 @@ Hairpin `wlan0→wlan0` is allowed so DNAT to clients works.
 
 ---
 
+## Live proxy toggle (hotkey)
+
+While the AP is running in a terminal, flip client traffic between **through the
+proxy** and **straight to the Internet** on the fly — no restart:
+
+* Press **`p`** → toggle a transparent REDIRECT of client `tcp {80 443}` to the
+  local proxy port (default **`8080`**, i.e. Burp/mitmproxy).
+* Press **`q`** → quit (same as Ctrl-C: everything is torn down).
+
+```bash
+# start with the proxy OFF (default) — press p to send traffic to Burp when you want it
+sudo ./simpleap.sh wlan0 eth0 PentestAP StrongPass123 --mode compat --channel 1
+
+# start with the proxy already ON, custom port / ports:
+sudo ./simpleap.sh wlan0 eth0 PentestAP StrongPass123 \
+  --proxy-on --proxy-port 8080 --proxy-ports "80 443 8443"
+```
+
+Options: `--proxy-port N` (default `8080`), `--proxy-ports "P.."` (default `"80 443"`),
+`--proxy-on` (start enabled). Each toggle also flushes the client's conntrack so the
+new routing takes effect immediately for live flows. The toggle is independent of
+`--forward` (which stays available for arbitrary custom REDIRECT/DNAT rules).
+
+> For intercepted HTTPS the device must trust your CA and the proxy must run in
+> transparent/invisible mode on the target port. The hotkeys need a real terminal
+> (a TTY); when the script is backgrounded it simply serves the AP without hotkeys.
+
+---
+
 ## Static DHCP leases
 
 ```bash
@@ -257,16 +286,41 @@ ss -lupn 'sport = :67 or :68 or :53'     # dnsmasq bound to 10.10.10.1?
 tcpdump -ni wlan0 -vvv port 67 or 68    # DHCPDISCOVER / OFFER / REQUEST / ACK visible?
 ```
 
-If DISCOVERs appear but no OFFERs: iptables `INPUT` policy was dropping; the script inserts accepts—ensure you ran it as root and nothing else overwrote your rules.
+Two root causes seen on Realtek AU + Kali, both handled automatically now:
+
+1. **Client associates + 4-way handshake completes, then no DHCP and it disconnects**
+   (`tcpdump` on `wlan0` shows *no* client frames, or only association in
+   `hostapd.log`). This is the `rtw88` USB adapter sleeping / USB-3 self-interference.
+   Fix (applied by `--install`, persisted in `/etc/modprobe.d/rtw88-ap.conf`):
+   ```bash
+   options rtw88_core disable_lps_deep=Y
+   options rtw88_usb  switch_usb_mode=N
+   # then: modprobe -r rtw88_8821au ... ; modprobe rtw88_8821au
+   ```
+
+2. **DISCOVER reaches `wlan0` and iptables shows it accepted, but dnsmasq never
+   answers** — the host runs a **native nftables firewall** (`table inet filter`,
+   `nftables.service`) with `policy drop` on `input`/`forward`. That base chain runs
+   *alongside* the iptables (`ip filter`) chain this script edits, so an iptables
+   ACCEPT is overridden by the inet-filter drop (DHCP dropped before dnsmasq; and
+   forwarding/Internet blocked too). `simpleap.sh` now detects this and adds the
+   matching accepts into `inet filter` (removed again on Ctrl-C / `--cleanup`). Check:
+   ```bash
+   nft list chain inet filter input     # should show iifname "wlan0" ... accept lines
+   nft list chain inet filter forward   # wlan0<->eth0 accepts present?
+   ```
+
+If DISCOVERs appear but no OFFERs and neither applies: another INPUT policy is
+dropping — ensure you ran the script as root and nothing else overwrote the rules.
 
 **SSID not visible**
 Use `--mode compat` and channel **1** or **6**. Fresh SSID. If still dead, reload the module and retry:
 
 ```bash
 sudo ip link set wlan0 down
-sudo modprobe -r 8812au 2>/dev/null || sudo modprobe -r rtl88xxau 2>/dev/null
+sudo modprobe -r rtw88_8821au rtw88_8812au 2>/dev/null
 sudo rfkill unblock all
-sudo modprobe 8812au 2>/dev/null || sudo modprobe rtl88xxau 2>/dev/null
+sudo modprobe rtw88_8821au 2>/dev/null || sudo modprobe rtw88_8812au 2>/dev/null
 ```
 
 Minimal hostapd check:
